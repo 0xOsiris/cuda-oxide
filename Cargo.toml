@@ -48,7 +48,8 @@ repository = "https://github.com/NVlabs/cuda-oxide.git"
 # Examples are in: crates/rustc-codegen-cuda/examples/
 
 [workspace.dependencies]
-# Pliron MLIR framework, pinned to upstream struct-layout and GEP no-wrap semantics.
+# Pliron MLIR framework, pinned to upstream struct-layout, GEP no-wrap, and
+# global-constant semantics.
 # pliron-llvm uses default-features = false to keep llvm-sys (LLVM 23) out:
 # cuda-oxide consumes the dialect modeling only, not the FFI bridge.
 # `crates/rustc-codegen-cuda/Cargo.toml` MUST stay on this same rev, or pliron
