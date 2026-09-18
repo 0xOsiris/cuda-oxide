@@ -784,6 +784,7 @@ fn main() {
                     materialize_cubin,
                     arch.as_deref(),
                 );
+                commands::warn_for_default_build_arch(&ctx, arch.as_deref());
                 commands::codegen_build(
                     &ctx,
                     &example,
@@ -820,6 +821,7 @@ fn main() {
                     materialize_cubin,
                     arch.as_deref(),
                 );
+                commands::warn_for_default_build_arch(&ctx, arch.as_deref());
                 commands::codegen_cargo_passthrough(
                     &ctx,
                     commands::CargoPassthroughSubcommand::Build,
