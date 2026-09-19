@@ -358,7 +358,7 @@ fn generic_storage_dispatches_by_address_and_merges_old_values() -> anyhow::Resu
         .iter()
         .filter_map(|&op| Operation::get_op::<llvm::InlineAsmOp>(op, &ctx))
         .find(|asm| {
-            String::from((*asm.get_attr_inline_asm_template(&ctx).unwrap()).clone())
+            String::from((*asm.get_attr_llvm_inline_asm_template(&ctx).unwrap()).clone())
                 .starts_with("st.")
         })
         .unwrap()
@@ -384,7 +384,7 @@ fn generic_storage_dispatches_by_address_and_merges_old_values() -> anyhow::Resu
             incoming.push(op.deref(&ctx).get_operand(0));
         }
         if let Some(asm) = Operation::get_op::<llvm::InlineAsmOp>(op, &ctx)
-            && String::from((*asm.get_attr_inline_asm_template(&ctx).unwrap()).clone())
+            && String::from((*asm.get_attr_llvm_inline_asm_template(&ctx).unwrap()).clone())
                 .starts_with("fence.")
         {
             fences += 1;
@@ -407,7 +407,7 @@ fn generic_storage_dispatches_by_address_and_merges_old_values() -> anyhow::Resu
         .iter()
         .filter_map(|&op| Operation::get_op::<llvm::InlineAsmOp>(op, &ctx))
         .find(|asm| {
-            String::from((*asm.get_attr_inline_asm_template(&ctx).unwrap()).clone())
+            String::from((*asm.get_attr_llvm_inline_asm_template(&ctx).unwrap()).clone())
                 .starts_with("st.")
         })
         .unwrap()
