@@ -202,16 +202,25 @@ mod grid_sync_kernels {
 // Typed cooperative-groups kernels
 // =============================================================================
 
-/// `WarpTile<32>::ballot(predicate)` should be byte-identical to
-/// `warp::ballot(predicate)`. With `predicate = lane_id() & 1`, every
-/// lane should report `0xAAAAAAAA`.
+/// Check the full-warp fast path for typed ballot and match collectives.
+/// With `predicate = lane_id() & 1`, every lane should report `0xAAAAAAAA`.
 #[kernel]
 pub fn test_typed_warp32_ballot(mut out: DisjointSlice<u32>) {
     let gid = thread::index_1d();
     let warp_tile = this_thread_block().tiled_partition::<32>();
+    let rank = warp_tile.thread_rank();
     let mask = warp_tile.ballot((warp::lane_id() & 1) != 0);
+    let expected_match = 0xFu32 << ((rank / 4) * 4);
+
+    let ok = (warp_tile.match_any(rank / 4) == expected_match)
+        & (warp_tile.match_any_i64((rank / 4) as u64) == expected_match)
+        & (warp_tile.match_all(42) == u32::MAX)
+        & (warp_tile.match_all_i64(42u64) == u32::MAX)
+        & (warp_tile.match_all(rank) == 0)
+        & (warp_tile.match_all_i64(rank as u64) == 0);
+
     if let Some(slot) = out.get_mut(gid) {
-        *slot = mask;
+        *slot = if ok { mask } else { u32::MAX };
     }
 }
 
@@ -238,8 +247,16 @@ pub fn test_typed_warp16_shfl(mut out: DisjointSlice<u32>) {
     tile.sync();
     let broadcast = tile.shfl(lane, 0);
     let rank = tile.thread_rank();
+    let expected_match = 0xFu32 << ((rank / 4) * 4);
+
     let tile_ok = (tile.shfl_xor(lane, 1) == (lane ^ 1))
         & (tile.shfl_xor(lane, 16) == lane)
+        & (tile.match_any(rank / 4) == expected_match)
+        & (tile.match_any_i64((rank / 4) as u64) == expected_match)
+        & (tile.match_all(42) == 0xFFFF)
+        & (tile.match_all_i64(42u64) == 0xFFFF)
+        & (tile.match_all(rank) == 0)
+        & (tile.match_all_i64(rank as u64) == 0)
         & (tile.shfl_down(lane, 1) == if rank < 15 { lane + 1 } else { lane })
         & (tile.shfl_up(lane, 1) == if rank > 0 { lane - 1 } else { lane })
         & (tile.shfl_xor_f32(lane as f32, 16) == lane as f32)
@@ -257,7 +274,16 @@ pub fn test_typed_warp16_shfl(mut out: DisjointSlice<u32>) {
             });
     let coalesced_ok = if lane & 1 == 0 {
         let group = coalesced_threads();
+        let group_rank = group.thread_rank();
+        let expected_match = 0xFu32 << ((group_rank / 4) * 4);
+
         (group.ballot((lane & 2) != 0) == 0xAAAA)
+            & (group.match_any(group_rank / 4) == expected_match)
+            & (group.match_any_i64((group_rank / 4) as u64) == expected_match)
+            & (group.match_all(42) == 0xFFFF)
+            & (group.match_all_i64(42u64) == 0xFFFF)
+            & (group.match_all(group_rank) == 0)
+            & (group.match_all_i64(group_rank as u64) == 0)
             & (group.shfl(lane, group.size()) == lane)
             & (group.shfl_xor(lane, 1) == lane)
             & (group.shfl_down(lane, 1) == lane)
@@ -274,9 +300,18 @@ pub fn test_typed_warp16_shfl(mut out: DisjointSlice<u32>) {
     // device regression cannot pass by merely shifting an even-lane ballot.
     let irregular_ok = if (0x8010_0089u32 & (1u32 << lane)) != 0 {
         let group = coalesced_threads();
+        let rank = group.thread_rank();
+        let expected_match = if rank & 1 == 0 { 0x15 } else { 0x0A };
+
         (group.ballot(lane == 3 || lane == 20 || lane == 31) == 0x1A)
             & (group.ballot(true) == 0x1F)
             & (group.ballot(false) == 0)
+            & (group.match_any(rank & 1) == expected_match)
+            & (group.match_any_i64((rank & 1) as u64) == expected_match)
+            & (group.match_all(42) == 0x1F)
+            & (group.match_all_i64(42u64) == 0x1F)
+            & (group.match_all(rank) == 0)
+            & (group.match_all_i64(rank as u64) == 0)
     } else {
         true
     };
