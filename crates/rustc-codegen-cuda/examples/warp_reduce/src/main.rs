@@ -16,7 +16,8 @@
 
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
-use cuda_device::{DisjointSlice, kernel, thread, warp};
+use cuda_device::cooperative_groups::{block_reduce, block_scan, ops::Sum, this_thread_block};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread, warp};
 use cuda_host::cuda_module;
 
 // =============================================================================
@@ -187,6 +188,42 @@ mod kernels {
 
         if let Some(out_elem) = out.get_mut(gid) {
             *out_elem = sum;
+        }
+    }
+
+    /// Regression coverage for block_reduce with a partial final warp.
+    #[kernel]
+    pub fn block_reduce_partial_warp(mut out: DisjointSlice<u32>) {
+        static mut SMEM: SharedArray<u32, 2> = SharedArray::UNINIT;
+
+        let gid = thread::index_1d();
+        let block = this_thread_block();
+
+        let total = block_reduce::<u32, Sum, 2>(&block, 1u32, &raw mut SMEM);
+
+        if gid.in_bounds(out.len()) {
+            unsafe {
+                *out.get_unchecked_mut(gid.get()) = total;
+            }
+        }
+    }
+
+    /// Regression coverage for block_scan with a partial final warp.
+    #[kernel]
+    pub fn block_scan_partial_warp_distinct(mut out: DisjointSlice<u32>) {
+        static mut SMEM: SharedArray<u32, 2> = SharedArray::UNINIT;
+
+        let gid = thread::index_1d();
+        let block = this_thread_block();
+
+        let value = gid.get() as u32 + 1;
+
+        let prefix = block_scan::<u32, Sum, 2>(&block, value, &raw mut SMEM);
+
+        if gid.in_bounds(out.len()) {
+            unsafe {
+                *out.get_unchecked_mut(gid.get()) = prefix;
+            }
         }
     }
 }
@@ -421,6 +458,66 @@ fn main() {
     } else {
         println!("✗ reduce_sum_f64 failed: {:?}", &f64_result[0..8]);
         std::process::exit(1);
+    }
+
+    // ===== Test 7: block_reduce partial-warp edge cases =====
+    println!("\n--- Test 7: block_reduce partial-warp edge cases ---");
+
+    for threads in [48u32, 17, 33] {
+        let cfg = LaunchConfig {
+            block_dim: (threads, 1, 1),
+            grid_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut out = DeviceBuffer::<u32>::zeroed(&stream, threads as usize).unwrap();
+
+        unsafe { module.block_reduce_partial_warp(stream.as_ref(), cfg, &mut out) }
+            .expect("partial-warp block_reduce launch failed");
+
+        let result = out.to_host_vec(&stream).unwrap();
+
+        if !result.iter().all(|&value| value == threads) {
+            println!(
+                "✗ block_reduce({threads}) returned an incorrect result: {:?}",
+                result
+            );
+            std::process::exit(1);
+        }
+
+        println!("✓ block_reduce({threads}) produced block sum {threads}");
+    }
+
+    // ===== Test 8: block_scan partial-warp edge cases =====
+    println!("\n--- Test 8: block_scan partial-warp edge cases ---");
+
+    for threads in [45u32, 17, 33] {
+        let cfg = LaunchConfig {
+            block_dim: (threads, 1, 1),
+            grid_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut out = DeviceBuffer::<u32>::zeroed(&stream, threads as usize).unwrap();
+
+        unsafe { module.block_scan_partial_warp_distinct(stream.as_ref(), cfg, &mut out) }
+            .expect("partial-warp block_scan launch failed");
+
+        let result = out.to_host_vec(&stream).unwrap();
+
+        for (tid, &value) in result.iter().enumerate() {
+            let n = tid as u32 + 1;
+            let expected = n * (n + 1) / 2;
+
+            if value != expected {
+                println!(
+                    "✗ block_scan({threads}) mismatch: tid {tid} expected {expected} got {value}"
+                );
+                std::process::exit(1);
+            }
+        }
+
+        println!("✓ block_scan({threads}) produced correct prefixes");
     }
 
     println!("\n✓ SUCCESS: All warp tests passed!");

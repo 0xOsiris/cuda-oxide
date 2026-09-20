@@ -82,8 +82,10 @@ every (op, lane/thread) pair.
 
 All scans are **inclusive**: thread `i` receives the reduction of
 values from threads `0..=i`. Block-scoped variants take a
-`*mut SharedArray<T, NUM_WARPS>` for warp-totals scratch — the
-demo uses `&raw mut SMEM` so callers don't need an `unsafe` block.
+`*mut SharedArray<T, NUM_WARPS>` for warp-totals scratch. `NUM_WARPS`
+is a capacity: it must be at least `ceil(block_threads / 32)`, and extra
+slots are allowed. Partial final warps are supported. The demo uses
+`&raw mut SMEM` so callers don't need an `unsafe` block.
 
 ## Layout Conventions
 
