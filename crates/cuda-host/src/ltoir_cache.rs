@@ -287,10 +287,9 @@ fn read_regular_file_exact(path: &Path, expected_length: u64) -> io::Result<Vec<
         // O_NOFOLLOW prevents a final symlink from escaping the cache, while
         // O_NONBLOCK prevents a raced FIFO/device replacement from blocking.
         // Named constants, not literal octal: these flag values are
-        // architecture-specific. The former literal 0o400000 is O_NOFOLLOW
-        // on x86-64 but O_DIRECT on aarch64, which both disarmed the symlink
-        // guard there and imposed O_DIRECT's buffer-alignment rules on every
-        // cache read.
+        // architecture-specific. For example, O_NOFOLLOW is 0o400000 on
+        // x86-64 but 0o100000 on aarch64, so the x86-64 literal does not
+        // prevent an aarch64 cache read from following a symlink.
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path).map_err(|error| {
