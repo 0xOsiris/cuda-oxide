@@ -16,7 +16,9 @@
 
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
-use cuda_device::cooperative_groups::{block_reduce, block_scan, ops::Sum, this_thread_block};
+use cuda_device::cooperative_groups::{
+    ThreadGroup, block_reduce, block_scan, ops::Sum, this_thread_block,
+};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread, warp};
 use cuda_host::cuda_module;
 
@@ -191,39 +193,39 @@ mod kernels {
         }
     }
 
-    /// Regression coverage for block_reduce with a partial final warp.
+    /// Exercise all live warp prefixes, extra scratch, and reuse in 1D/2D/3D.
     #[kernel]
     pub fn block_reduce_partial_warp(mut out: DisjointSlice<u32>) {
-        static mut SMEM: SharedArray<u32, 2> = SharedArray::UNINIT;
-
-        let gid = thread::index_1d();
+        static mut SMEM: SharedArray<u32, 32> = SharedArray::UNINIT;
         let block = this_thread_block();
-
-        let total = block_reduce::<u32, Sum, 2>(&block, 1u32, &raw mut SMEM);
-
-        if gid.in_bounds(out.len()) {
-            unsafe {
-                *out.get_unchecked_mut(gid.get()) = total;
-            }
+        let rank = block.thread_rank();
+        let index = thread::blockIdx_x() as usize * block.size() as usize + rank as usize;
+        // SAFETY: every block thread uses this allocation, with no other accesses.
+        let total = unsafe { block_reduce::<u32, Sum, 32>(&block, rank + 1, &raw mut SMEM) };
+        block.sync();
+        // Reuse catches a missing publication/read barrier between scratch phases.
+        let second = unsafe { block_reduce::<u32, Sum, 32>(&block, 2, &raw mut SMEM) };
+        cuda_device::gpu_assert!(second == 2 * block.size());
+        if index < out.len() {
+            // SAFETY: the linear rank is distinct for every thread in this launch.
+            unsafe { *out.get_unchecked_mut(index) = total };
         }
     }
 
-    /// Regression coverage for block_scan with a partial final warp.
     #[kernel]
     pub fn block_scan_partial_warp_distinct(mut out: DisjointSlice<u32>) {
-        static mut SMEM: SharedArray<u32, 2> = SharedArray::UNINIT;
-
-        let gid = thread::index_1d();
+        static mut SMEM: SharedArray<u32, 32> = SharedArray::UNINIT;
         let block = this_thread_block();
-
-        let value = gid.get() as u32 + 1;
-
-        let prefix = block_scan::<u32, Sum, 2>(&block, value, &raw mut SMEM);
-
-        if gid.in_bounds(out.len()) {
-            unsafe {
-                *out.get_unchecked_mut(gid.get()) = prefix;
-            }
+        let rank = block.thread_rank();
+        let index = thread::blockIdx_x() as usize * block.size() as usize + rank as usize;
+        // SAFETY: every block thread uses this allocation, with no other accesses.
+        let prefix = unsafe { block_scan::<u32, Sum, 32>(&block, rank + 1, &raw mut SMEM) };
+        block.sync();
+        let second = unsafe { block_scan::<u32, Sum, 32>(&block, 2, &raw mut SMEM) };
+        cuda_device::gpu_assert!(second == 2 * (rank + 1));
+        if index < out.len() {
+            // SAFETY: the linear rank is distinct for every thread in this launch.
+            unsafe { *out.get_unchecked_mut(index) = prefix };
         }
     }
 }
@@ -460,65 +462,58 @@ fn main() {
         std::process::exit(1);
     }
 
-    // ===== Test 7: block_reduce partial-warp edge cases =====
-    println!("\n--- Test 7: block_reduce partial-warp edge cases ---");
-
-    for threads in [48u32, 17, 33] {
+    // All prefix lengths, full-warp controls, maximum capacity, and 2D/3D ranks.
+    let shapes = (1..=65).map(|x| (x, 1, 1)).chain([
+        (95, 1, 1),
+        (96, 1, 1),
+        (97, 1, 1),
+        (255, 1, 1),
+        (256, 1, 1),
+        (257, 1, 1),
+        (1023, 1, 1),
+        (1024, 1, 1),
+        (3, 5, 3),
+        (8, 3, 2),
+        (7, 3, 3),
+        (8, 8, 8),
+    ]);
+    let mut shape_count = 0;
+    for shape in shapes {
+        let threads = shape.0 * shape.1 * shape.2;
         let cfg = LaunchConfig {
-            block_dim: (threads, 1, 1),
-            grid_dim: (1, 1, 1),
+            block_dim: shape,
+            grid_dim: (2, 1, 1),
             shared_mem_bytes: 0,
         };
-
-        let mut out = DeviceBuffer::<u32>::zeroed(&stream, threads as usize).unwrap();
-
-        unsafe { module.block_reduce_partial_warp(stream.as_ref(), cfg, &mut out) }
-            .expect("partial-warp block_reduce launch failed");
-
-        let result = out.to_host_vec(&stream).unwrap();
-
-        if !result.iter().all(|&value| value == threads) {
-            println!(
-                "✗ block_reduce({threads}) returned an incorrect result: {:?}",
-                result
+        let sentinel = vec![u32::MAX; 2 * threads as usize];
+        let mut reduced = DeviceBuffer::from_host(&stream, &sentinel).unwrap();
+        let mut scanned = DeviceBuffer::from_host(&stream, &sentinel).unwrap();
+        // SAFETY: both CTAs run every thread through the collectives and outputs
+        // contain one slot per linear thread rank.
+        unsafe {
+            module
+                .block_reduce_partial_warp(stream.as_ref(), cfg, &mut reduced)
+                .expect("block_reduce launch failed");
+            module
+                .block_scan_partial_warp_distinct(stream.as_ref(), cfg, &mut scanned)
+                .expect("block_scan launch failed");
+        }
+        let reduced = reduced.to_host_vec(&stream).unwrap();
+        let scanned = scanned.to_host_vec(&stream).unwrap();
+        let total = threads * (threads + 1) / 2;
+        for (index, (&sum, &prefix)) in reduced.iter().zip(&scanned).enumerate() {
+            let rank = index as u32 % threads + 1;
+            assert_eq!(sum, total, "reduce {shape:?}, index {index}");
+            assert_eq!(
+                prefix,
+                rank * (rank + 1) / 2,
+                "scan {shape:?}, index {index}"
             );
-            std::process::exit(1);
         }
-
-        println!("✓ block_reduce({threads}) produced block sum {threads}");
+        shape_count += 1;
     }
-
-    // ===== Test 8: block_scan partial-warp edge cases =====
-    println!("\n--- Test 8: block_scan partial-warp edge cases ---");
-
-    for threads in [45u32, 17, 33] {
-        let cfg = LaunchConfig {
-            block_dim: (threads, 1, 1),
-            grid_dim: (1, 1, 1),
-            shared_mem_bytes: 0,
-        };
-
-        let mut out = DeviceBuffer::<u32>::zeroed(&stream, threads as usize).unwrap();
-
-        unsafe { module.block_scan_partial_warp_distinct(stream.as_ref(), cfg, &mut out) }
-            .expect("partial-warp block_scan launch failed");
-
-        let result = out.to_host_vec(&stream).unwrap();
-
-        for (tid, &value) in result.iter().enumerate() {
-            let n = tid as u32 + 1;
-            let expected = n * (n + 1) / 2;
-
-            if value != expected {
-                println!(
-                    "✗ block_scan({threads}) mismatch: tid {tid} expected {expected} got {value}"
-                );
-                std::process::exit(1);
-            }
-        }
-
-        println!("✓ block_scan({threads}) produced correct prefixes");
-    }
-
+    println!(
+        "✓ block reduction and scan passed {shape_count} launch shapes, two CTAs, and scratch reuse"
+    );
     println!("\n✓ SUCCESS: All warp tests passed!");
 }

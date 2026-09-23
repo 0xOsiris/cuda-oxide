@@ -186,3 +186,5 @@ The recipe is identical for every test in the file:
 
 Following this pattern keeps the harness uniform — every check is
 self-contained and the success/fail signal is unambiguous.
+
+Block reductions and scans take an unsafe raw scratch pointer. Every block thread must use the same live shared allocation; no other operation may access it, and a block barrier is required before reuse.
