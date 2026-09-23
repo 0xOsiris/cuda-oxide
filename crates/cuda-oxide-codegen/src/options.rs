@@ -168,6 +168,38 @@ mod tests {
     use super::DeviceArchHint;
 
     #[test]
+    fn supplied_device_hint_takes_precedence_over_the_environment() {
+        const CHILD: &str = "CUDA_OXIDE_TEST_DEVICE_HINT_PRECEDENCE";
+        if std::env::var_os(CHILD).is_some() {
+            let hint = DeviceArchHint::parse("sm_120".to_string());
+            let explicit = super::BackendOptions::from_env_with_device_hint(Some(hint.clone()));
+            assert_eq!(explicit.device_arch_hint, Some(hint));
+            assert_eq!(
+                super::BackendOptions::from_env().device_arch_hint,
+                Some(DeviceArchHint::Invalid("compute_120".to_string()))
+            );
+            return;
+        }
+        // Keep process-global environment mutation out of parallel tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "options::tests::supplied_device_hint_takes_precedence_over_the_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CUDA_OXIDE_DEVICE_ARCH", "compute_120")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn device_hint_boundary_preserves_invalid_values_and_absence() {
         assert_eq!(
             DeviceArchHint::from_env_value(Err(std::env::VarError::NotPresent)),
