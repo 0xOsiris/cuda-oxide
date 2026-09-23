@@ -356,6 +356,11 @@ impl ThreadBlock {
     /// participation mask is computed at runtime from this lane's
     /// `lane_id()`.
     ///
+    /// The block's total thread count must be evenly divisible by `N`, as
+    /// required by CUDA Cooperative Groups `tiled_partition`. This launch-time
+    /// precondition is not checked here; the caller must choose a block size
+    /// that does not leave a partial final tile.
+    ///
     /// Compile-time `N` validation: a `const { assert!(...) }` block
     /// rejects illegal sizes at compile time.
     #[inline(always)]
@@ -1117,6 +1122,144 @@ where
     acc
 }
 
+/// Warp group representing exactly the contiguous physical lanes `0..live`.
+///
+/// This exists only as an implementation detail for partial final warps.
+/// For this group shape, group rank equals physical lane ID, and a
+/// `shfl_up` source is guaranteed to be a member whenever `lane >= delta`.
+/// Other collective operations delegate to `CoalescedThreads` so the full
+/// `WarpCollective` contract remains intact.
+#[derive(Copy, Clone)]
+struct ContiguousWarpPrefix(CoalescedThreads);
+
+impl ThreadGroup for ContiguousWarpPrefix {
+    #[inline(always)]
+    fn size(&self) -> u32 {
+        self.0.size()
+    }
+
+    #[inline(always)]
+    fn thread_rank(&self) -> u32 {
+        warp::lane_id()
+    }
+
+    #[inline(always)]
+    fn sync(&self) {
+        self.0.sync()
+    }
+}
+
+impl WarpCollective for ContiguousWarpPrefix {
+    #[inline(always)]
+    fn ballot(&self, predicate: bool) -> u32 {
+        self.0.ballot(predicate)
+    }
+
+    #[inline(always)]
+    fn all(&self, predicate: bool) -> bool {
+        self.0.all(predicate)
+    }
+
+    #[inline(always)]
+    fn any(&self, predicate: bool) -> bool {
+        self.0.any(predicate)
+    }
+
+    #[inline(always)]
+    fn shfl(&self, var: u32, src_rank: u32) -> u32 {
+        self.0.shfl(var, src_rank)
+    }
+
+    #[inline(always)]
+    fn shfl_xor(&self, var: u32, lane_mask: u32) -> u32 {
+        self.0.shfl_xor(var, lane_mask)
+    }
+
+    #[inline(always)]
+    fn shfl_down(&self, var: u32, delta: u32) -> u32 {
+        self.0.shfl_down(var, delta)
+    }
+
+    #[inline(always)]
+    fn shfl_up(&self, var: u32, delta: u32) -> u32 {
+        warp::shuffle_up_sync(self.0.mask, var, delta)
+    }
+
+    #[inline(always)]
+    fn shfl_f32(&self, var: f32, src_rank: u32) -> f32 {
+        self.0.shfl_f32(var, src_rank)
+    }
+
+    #[inline(always)]
+    fn shfl_xor_f32(&self, var: f32, lane_mask: u32) -> f32 {
+        self.0.shfl_xor_f32(var, lane_mask)
+    }
+
+    #[inline(always)]
+    fn shfl_down_f32(&self, var: f32, delta: u32) -> f32 {
+        self.0.shfl_down_f32(var, delta)
+    }
+
+    #[inline(always)]
+    fn shfl_up_f32(&self, var: f32, delta: u32) -> f32 {
+        warp::shuffle_up_f32_sync(self.0.mask, var, delta)
+    }
+
+    #[inline(always)]
+    fn match_any(&self, value: u32) -> u32 {
+        self.0.match_any(value)
+    }
+
+    #[inline(always)]
+    fn match_any_i64(&self, value: u64) -> u32 {
+        self.0.match_any_i64(value)
+    }
+
+    #[inline(always)]
+    fn match_all(&self, value: u32) -> u32 {
+        self.0.match_all(value)
+    }
+
+    #[inline(always)]
+    fn match_all_i64(&self, value: u64) -> u32 {
+        self.0.match_all_i64(value)
+    }
+}
+
+/// Inclusive scan across the contiguous low-lane prefix of a physical warp.
+///
+/// `live` is the number of participating lanes and must be in `1..=31`;
+/// the full 32-lane case uses the regular [`warp_scan`] fast path instead.
+/// Unlike [`warp_scan`], this helper carries a runtime member mask so the
+/// final partial warp of a thread block does not name nonexistent lanes.
+///
+/// This is intentionally private and specific to a contiguous prefix:
+/// physical lane IDs and group ranks are identical only for that shape.
+#[inline(always)]
+fn scan_contiguous_warp_prefix<T, Op>(value: T, live: u32) -> T
+where
+    T: WarpShuffle,
+    Op: ops::ReduceOp<T>,
+{
+    let group = ContiguousWarpPrefix(CoalescedThreads {
+        mask: (1u32 << live) - 1,
+    });
+
+    let mut acc = value;
+    let rank = group.thread_rank();
+    let mut delta: u32 = 1;
+
+    while delta < live {
+        let other = T::shfl_up_via(&group, acc, delta);
+        if rank >= delta {
+            acc = Op::combine(acc, other);
+        }
+        delta <<= 1;
+    }
+
+    acc
+}
+
 /// Linear warp index inside the current block. Works for any block dim
 /// shape; `warp::warp_id` only handles the 1D case.
 #[inline(always)]
@@ -1128,18 +1271,24 @@ fn warp_in_block_linear() -> u32 {
 ///
 /// Three-phase shape (the same shape CUB and cuCollections use):
 ///
-/// 1. Each warp warp-reduces its 32 lanes' values via [`warp_reduce`].
-/// 2. Lane 0 of each warp writes its warp's total to `smem[warp_id]`,
-///    then `block.sync()`.
+/// 1. Each full warp reduces via [`warp_reduce`]. A partial final warp
+///    scans only its live contiguous lane prefix to obtain its warp total.
+/// 2. Full warps publish from lane 0; a partial final warp publishes from
+///    its last live lane. Each total is written to `smem[warp_id]`, then
+///    `block.sync()`.
 /// 3. The first warp loads the per-warp totals (filling unused slots with
 ///    `Op::identity()`), warp-reduces them, and lane 0 writes the
 ///    block-wide result back to `smem[0]`. After a second `block.sync()`
 ///    every thread reads `smem[0]`.
 ///
-/// `NUM_WARPS` must equal `BLOCK_SIZE / 32`. It's a `usize` const-generic
-/// so it lines up with the [`SharedArray`] length parameter; the
-/// compile-time check rejects values outside `1..=32` (i.e. block sizes
-/// outside `32..=1024`).
+/// `NUM_WARPS` is the shared-memory capacity in warp totals. It must be at
+/// least `ceil(block_threads / 32)` for the launched block. Extra capacity is
+/// allowed and is not read. The compile-time check restricts the capacity to
+/// `1..=32`, while the runtime check rejects launches whose block needs more
+/// warp-total slots than the supplied [`SharedArray`].
+///
+/// Partial final warps are supported: full warps keep the butterfly fast
+/// path, while a partial tail uses only its contiguous live-lane prefix.
 ///
 /// # Smem reuse
 ///
@@ -1148,14 +1297,16 @@ fn warp_in_block_linear() -> u32 {
 /// kernel **must** place a `block.sync()` between calls — otherwise
 /// late readers from the first call may race the writes of the second.
 ///
-/// # Why a raw pointer?
+/// # Safety
 ///
-/// We take `*mut SharedArray<T, NUM_WARPS>` rather than `&mut` so that
-/// callers can pass `&raw mut SMEM` directly without an `unsafe` block
-/// at the call site (Rust 2024 forbids `&mut` references to a
-/// `static mut`, but `&raw mut` is safe). The unsafety — that nothing
-/// else aliases the static for the duration of the call — is local to
-/// this function body, where the helpers and barriers below preserve it.
+/// `smem` must point to one live `static mut SharedArray` in the current
+/// block. Every thread in that block must call this operation with the same
+/// scratch allocation and must reach every collective and barrier. No other
+/// operation may access that scratch until all callers have finished; place
+/// a block barrier before reusing it. The allocation need not be initialized.
+///
+/// Raw element accesses avoid creating overlapping mutable references to
+/// the complete shared allocation in different CUDA threads.
 ///
 /// # Example
 ///
@@ -1168,13 +1319,13 @@ fn warp_in_block_linear() -> u32 {
 ///     // 8 = 256 / 32 warps per 256-thread block
 ///     static mut SMEM: SharedArray<u32, 8> = SharedArray::UNINIT;
 ///     let block = this_thread_block();
-///     let total = block_reduce::<u32, Sum, _>(&block, my_value, &raw mut SMEM);
+///     // SAFETY: all block threads use this scratch, with no other accesses.
+///     let total = unsafe { block_reduce::<u32, Sum, _>(&block, my_value, &raw mut SMEM) };
 ///     // every thread now holds the block-wide total
 /// }
 /// ```
 #[inline(always)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn block_reduce<T, Op, const NUM_WARPS: usize>(
+pub unsafe fn block_reduce<T, Op, const NUM_WARPS: usize>(
     block: &ThreadBlock,
     value: T,
     smem: *mut SharedArray<T, NUM_WARPS>,
@@ -1186,42 +1337,58 @@ where
     const {
         assert!(
             NUM_WARPS > 0 && NUM_WARPS <= 32,
-            "block_reduce requires 1..=32 warps (block size 32..=1024)",
+            "block_reduce requires 1..=32 warps of shared-memory capacity",
         );
     }
 
-    // SAFETY: The caller (a kernel) hands us a raw pointer to a `static mut
-    // SharedArray<T, NUM_WARPS>`. Within this function:
-    //   - all writes occur at distinct (warp_id, lane==0) or (lane==0) sites,
-    //   - all reads are separated from prior writes by `block.sync()`.
-    // No other reference to the static exists for the duration of the call.
-    let smem: &mut SharedArray<T, NUM_WARPS> = unsafe { &mut *smem };
+    let block_threads = threads_per_block();
+    let runtime_warps = block_threads.div_ceil(32);
+    crate::gpu_assert!(runtime_warps as usize <= NUM_WARPS);
 
-    let warp = block.tiled_partition::<32>();
-    let lane = warp.thread_rank();
+    // SAFETY: the caller provides the block's shared allocation. Capacity was
+    // checked above; one lane publishes each slot and barriers separate phases.
+    let smem = unsafe { SharedArray::as_raw_mut_ptr(smem) };
+
+    let lane = warp::lane_id();
     let warp_id = warp_in_block_linear();
 
-    let warp_total = warp_reduce::<T, Op, 32>(&warp, value);
+    let remaining = block_threads - warp_id * 32;
+    let live = if remaining < 32 { remaining } else { 32 };
 
-    if lane == 0 {
-        smem[warp_id as usize] = warp_total;
+    if live == 32 {
+        // This branch is reached only by a complete physical warp, so a
+        // full WarpTile<32> is valid even when the enclosing block has a
+        // partial final warp.
+        let warp = WarpTile::<32> { _priv: () };
+        let warp_total = warp_reduce::<T, Op, 32>(&warp, value);
+        if lane == 0 {
+            unsafe { smem.add(warp_id as usize).write(warp_total) };
+        }
+    } else {
+        let warp_prefix = scan_contiguous_warp_prefix::<T, Op>(value, live);
+        if lane + 1 == live {
+            unsafe { smem.add(warp_id as usize).write(warp_prefix) };
+        }
     }
     block.sync();
 
-    if warp_id == 0 {
-        let v: T = if (lane as usize) < NUM_WARPS {
-            smem[lane as usize]
+    if runtime_warps > 1 && warp_id == 0 {
+        // runtime_warps > 1 implies block_threads >= 33, therefore warp 0
+        // is necessarily a complete physical warp.
+        let warp = WarpTile::<32> { _priv: () };
+        let v: T = if lane < runtime_warps {
+            unsafe { smem.add(lane as usize).read() }
         } else {
             <Op as ops::ReduceOp<T>>::identity()
         };
         let block_total = warp_reduce::<T, Op, 32>(&warp, v);
         if lane == 0 {
-            smem[0] = block_total;
+            unsafe { smem.write(block_total) };
         }
     }
     block.sync();
 
-    smem[0]
+    unsafe { smem.read() }
 }
 
 /// Inclusive scan across a thread block. Thread `i` (in linear order
@@ -1230,18 +1397,27 @@ where
 ///
 /// Three-phase shape:
 ///
-/// 1. Each warp does an inclusive [`warp_scan`].
-/// 2. Lane 31 of each warp writes its warp total (= last value of its
-///    inclusive scan) to `smem[warp_id]`, then `block.sync()`.
+/// 1. Each full warp does an inclusive [`warp_scan`]. A partial final warp
+///    scans only its live contiguous lane prefix.
+/// 2. The last live lane of each warp writes its warp total (= last value of
+///    its inclusive scan) to `smem[warp_id]`, then `block.sync()`.
 /// 3. Warp 0 inclusive-scans the warp totals, then converts to an
-///    exclusive prefix and writes back to `smem[0..NUM_WARPS]`. After
+///    exclusive prefix and writes back to `smem[0..runtime_warps]`. After
 ///    `block.sync()` every thread reads its own warp's exclusive prefix
 ///    and combines it with its intra-warp inclusive value.
 ///
-/// `NUM_WARPS` must equal `BLOCK_SIZE / 32`. Same `SharedArray` reuse
-/// contract as [`block_reduce`] — caller must `block.sync()` before
-/// reusing the same smem. Same raw-pointer rationale as well: pass
-/// `&raw mut SMEM` from the call site (no `unsafe` block needed).
+/// `NUM_WARPS` is the shared-memory capacity in warp totals and must be at
+/// least `ceil(block_threads / 32)` for the launched block. Extra capacity is
+/// allowed and is not read. Partial final warps are supported.
+///
+/// Same `SharedArray` reuse contract as [`block_reduce`] — caller must
+/// `block.sync()` before reusing the same smem. Same raw-pointer rationale
+/// as well: pass `&raw mut SMEM` from the call site.
+///
+/// # Safety
+///
+/// The allocation, participation, exclusive scratch use, and reuse-barrier
+/// requirements are the same as [`block_reduce`].
 ///
 /// # Example
 ///
@@ -1253,13 +1429,13 @@ where
 /// pub fn my_kernel(...) {
 ///     static mut SMEM: SharedArray<u32, 8> = SharedArray::UNINIT;
 ///     let block = this_thread_block();
-///     let prefix = block_scan::<u32, Sum, _>(&block, 1u32, &raw mut SMEM);
+///     // SAFETY: all block threads use this scratch, with no other accesses.
+///     let prefix = unsafe { block_scan::<u32, Sum, _>(&block, 1u32, &raw mut SMEM) };
 ///     // thread i now holds i + 1 (inclusive scan of all-ones)
 /// }
 /// ```
 #[inline(always)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn block_scan<T, Op, const NUM_WARPS: usize>(
+pub unsafe fn block_scan<T, Op, const NUM_WARPS: usize>(
     block: &ThreadBlock,
     value: T,
     smem: *mut SharedArray<T, NUM_WARPS>,
@@ -1271,31 +1447,55 @@ where
     const {
         assert!(
             NUM_WARPS > 0 && NUM_WARPS <= 32,
-            "block_scan requires 1..=32 warps (block size 32..=1024)",
+            "block_scan requires 1..=32 warps of shared-memory capacity",
         );
     }
 
-    // SAFETY: see `block_reduce`.
-    let smem: &mut SharedArray<T, NUM_WARPS> = unsafe { &mut *smem };
+    let block_threads = threads_per_block();
+    let runtime_warps = block_threads.div_ceil(32);
+    crate::gpu_assert!(runtime_warps as usize <= NUM_WARPS);
 
-    let warp = block.tiled_partition::<32>();
-    let lane = warp.thread_rank();
+    let lane = warp::lane_id();
     let warp_id = warp_in_block_linear();
 
-    let warp_inclusive = warp_scan::<T, Op, 32>(&warp, value);
+    let remaining = block_threads - warp_id * 32;
+    let live = if remaining < 32 { remaining } else { 32 };
 
-    if lane == 31 {
-        smem[warp_id as usize] = warp_inclusive;
+    let warp_inclusive = if live == 32 {
+        // Only complete physical warps take this path.
+        let warp = WarpTile::<32> { _priv: () };
+        warp_scan::<T, Op, 32>(&warp, value)
+    } else {
+        scan_contiguous_warp_prefix::<T, Op>(value, live)
+    };
+
+    // A single warp already has the complete block-wide inclusive scan.
+    // This also avoids invoking a full-warp collective when that sole warp
+    // is partial.
+    if runtime_warps == 1 {
+        return warp_inclusive;
+    }
+
+    // SAFETY: capacity was checked above. Every warp publishes exactly one
+    // initialized total into its own scratch slot before the first barrier.
+    let smem = unsafe { SharedArray::as_raw_mut_ptr(smem) };
+
+    if lane + 1 == live {
+        unsafe { smem.add(warp_id as usize).write(warp_inclusive) };
     }
     block.sync();
 
     if warp_id == 0 {
-        let v: T = if (lane as usize) < NUM_WARPS {
-            smem[lane as usize]
+        // Reaching the cross-warp phase implies runtime_warps > 1, so the
+        // first physical warp is complete.
+        let warp = WarpTile::<32> { _priv: () };
+        let v: T = if lane < runtime_warps {
+            unsafe { smem.add(lane as usize).read() }
         } else {
             <Op as ops::ReduceOp<T>>::identity()
         };
         let inclusive = warp_scan::<T, Op, 32>(&warp, v);
+
         // Inclusive -> exclusive: shift right by one lane and force
         // identity at lane 0. shfl_up at lane 0 returns own value, so
         // explicit branch is needed.
@@ -1305,13 +1505,14 @@ where
         } else {
             shifted
         };
-        if (lane as usize) < NUM_WARPS {
-            smem[lane as usize] = exclusive;
+
+        if lane < runtime_warps {
+            unsafe { smem.add(lane as usize).write(exclusive) };
         }
     }
     block.sync();
 
-    let prefix: T = smem[warp_id as usize];
+    let prefix: T = unsafe { smem.add(warp_id as usize).read() };
     Op::combine(prefix, warp_inclusive)
 }
 

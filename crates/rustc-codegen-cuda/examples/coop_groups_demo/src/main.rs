@@ -502,17 +502,24 @@ pub fn test_block_reduce_u32(mut out: DisjointSlice<u32>) {
     let v_one = 1u32 << (tid & 31);
     let v_inv = !v_one;
 
-    let r_sum = block_reduce::<u32, Sum, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+
+    let r_sum = unsafe { block_reduce::<u32, Sum, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_min = block_reduce::<u32, Min, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_min = unsafe { block_reduce::<u32, Min, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_max = block_reduce::<u32, Max, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_max = unsafe { block_reduce::<u32, Max, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_and = block_reduce::<u32, BitAnd, _>(&block, v_inv, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_and = unsafe { block_reduce::<u32, BitAnd, _>(&block, v_inv, &raw mut SMEM) };
     block.sync();
-    let r_or = block_reduce::<u32, BitOr, _>(&block, v_one, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_or = unsafe { block_reduce::<u32, BitOr, _>(&block, v_one, &raw mut SMEM) };
     block.sync();
-    let r_xor = block_reduce::<u32, BitXor, _>(&block, v_one, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_xor = unsafe { block_reduce::<u32, BitXor, _>(&block, v_one, &raw mut SMEM) };
 
     if tid == 0 {
         let base = block_id * 6;
@@ -538,11 +545,15 @@ pub fn test_block_reduce_i32(mut out: DisjointSlice<i32>) {
     // value = tid - 48: range [-48, 47] over a 96-thread block.
     let v = (tid as i32) - 48;
 
-    let r_sum = block_reduce::<i32, Sum, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+
+    let r_sum = unsafe { block_reduce::<i32, Sum, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_min = block_reduce::<i32, Min, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_min = unsafe { block_reduce::<i32, Min, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_max = block_reduce::<i32, Max, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_max = unsafe { block_reduce::<i32, Max, _>(&block, v, &raw mut SMEM) };
 
     if tid == 0 {
         let base = block_id * 3;
@@ -564,11 +575,15 @@ pub fn test_block_reduce_f32(mut out: DisjointSlice<f32>) {
 
     let v = tid as f32;
 
-    let r_sum = block_reduce::<f32, Sum, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+
+    let r_sum = unsafe { block_reduce::<f32, Sum, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_min = block_reduce::<f32, Min, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_min = unsafe { block_reduce::<f32, Min, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_max = block_reduce::<f32, Max, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_max = unsafe { block_reduce::<f32, Max, _>(&block, v, &raw mut SMEM) };
 
     if tid == 0 {
         let base = block_id * 3;
@@ -596,17 +611,24 @@ pub fn test_block_scan_u32(mut out: DisjointSlice<u32>) {
     let v_one = 1u32 << (tid & 31);
     let v_inv = !v_one;
 
-    let r_sum = block_scan::<u32, Sum, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+
+    let r_sum = unsafe { block_scan::<u32, Sum, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_min = block_scan::<u32, Min, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_min = unsafe { block_scan::<u32, Min, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_max = block_scan::<u32, Max, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_max = unsafe { block_scan::<u32, Max, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_and = block_scan::<u32, BitAnd, _>(&block, v_inv, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_and = unsafe { block_scan::<u32, BitAnd, _>(&block, v_inv, &raw mut SMEM) };
     block.sync();
-    let r_or = block_scan::<u32, BitOr, _>(&block, v_one, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_or = unsafe { block_scan::<u32, BitOr, _>(&block, v_one, &raw mut SMEM) };
     block.sync();
-    let r_xor = block_scan::<u32, BitXor, _>(&block, v_one, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_xor = unsafe { block_scan::<u32, BitXor, _>(&block, v_one, &raw mut SMEM) };
 
     let base = (global_tid as usize) * 6;
     unsafe {
@@ -630,11 +652,15 @@ pub fn test_block_scan_i32(mut out: DisjointSlice<i32>) {
 
     let v = (tid as i32) - 48;
 
-    let r_sum = block_scan::<i32, Sum, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+
+    let r_sum = unsafe { block_scan::<i32, Sum, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_min = block_scan::<i32, Min, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_min = unsafe { block_scan::<i32, Min, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_max = block_scan::<i32, Max, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_max = unsafe { block_scan::<i32, Max, _>(&block, v, &raw mut SMEM) };
 
     let base = (global_tid as usize) * 3;
     unsafe {
@@ -655,11 +681,15 @@ pub fn test_block_scan_f32(mut out: DisjointSlice<f32>) {
 
     let v = tid as f32;
 
-    let r_sum = block_scan::<f32, Sum, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+
+    let r_sum = unsafe { block_scan::<f32, Sum, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_min = block_scan::<f32, Min, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_min = unsafe { block_scan::<f32, Min, _>(&block, v, &raw mut SMEM) };
     block.sync();
-    let r_max = block_scan::<f32, Max, _>(&block, v, &raw mut SMEM);
+    // SAFETY: every block thread uses this allocation; barriers separate reuse.
+    let r_max = unsafe { block_scan::<f32, Max, _>(&block, v, &raw mut SMEM) };
 
     let base = (global_tid as usize) * 3;
     unsafe {
