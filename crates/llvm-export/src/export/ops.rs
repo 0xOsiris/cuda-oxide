@@ -1850,9 +1850,7 @@ impl<'a> ModuleExportState<'a> {
             .get_attr_llvm_inline_asm_side_effects(self.ctx)
             .map(|attr| bool::from((*attr).clone()))
             .unwrap_or(true);
-        let is_convergent = op
-            .get_attr_llvm_inline_asm_attrs(self.ctx)
-            .is_some_and(|attrs| attrs.has("convergent"));
+        let is_convergent = ops::inline_asm_convergence(self.ctx, op)?;
 
         // pliron-llvm always stores a single result slot (a void result for
         // no-value asm), so decide void vs valued by the result *type*, not the

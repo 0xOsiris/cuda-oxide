@@ -347,16 +347,38 @@ pub mod ops {
 
     /// Derive the CUDA convenience classification from upstream LLVM semantics.
     ///
-    /// `None` means the required upstream side-effect attribute is malformed or
-    /// missing. A verified `InlineAsmOp` always returns `Some`.
+    /// `None` means a semantic attribute is missing, malformed, or unsupported
+    /// by cuda-oxide's exporter. Upstream verification alone does not check the
+    /// supported call-site attribute subset.
     pub fn asm_kind_opt(ctx: &Context, op: &InlineAsmOp) -> Option<AsmKind> {
         let side_effects = op
             .get_attr_llvm_inline_asm_side_effects(ctx)
             .map(|attr| bool::from((*attr).clone()))?;
-        let convergent = op
-            .get_attr_llvm_inline_asm_attrs(ctx)
-            .is_some_and(|attrs| attrs.has("convergent"));
+        let convergent = inline_asm_convergence(ctx, op).ok()?;
         Some(AsmKind::from_semantics(convergent, side_effects))
+    }
+
+    /// The native exporter supports the unit `convergent` call-site attribute.
+    /// Other LLVM attributes must be modeled explicitly before export can
+    /// preserve them; silently dropping one can weaken optimizer restrictions.
+    pub(crate) fn inline_asm_convergence(ctx: &Context, op: &InlineAsmOp) -> Result<bool, String> {
+        let mut convergent = false;
+        if let Some(attrs) = op.get_attr_llvm_inline_asm_attrs(ctx) {
+            for (name, value) in attrs.iter() {
+                match (name, value) {
+                    ("convergent", LlvmAttrValue::Unit) => convergent = true,
+                    ("convergent", _) => {
+                        return Err("LLVM inline asm `convergent` requires a unit attribute".into());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unsupported LLVM inline asm call-site attribute `{name}`; only unit `convergent` is supported"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(convergent)
     }
 
     /// Query the CUDA convenience classification for an `InlineAsmOp`.

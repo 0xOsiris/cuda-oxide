@@ -553,6 +553,65 @@ fn export_inline_asm_respects_upstream_semantics() {
 }
 
 #[test]
+fn export_inline_asm_checks_the_supported_attribute_subset() {
+    use llvm_export::ops::{LlvmAttrValue, LlvmAttributesAttr};
+    let export = |side_effects: bool, attribute: Option<(&str, LlvmAttrValue)>| {
+        let mut ctx = Context::new();
+        let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+        let module_block = module_top_block(&mut ctx, &module);
+        let void_ty = VoidType::get(&ctx);
+        let func_ty = FuncType::get(&ctx, void_ty.to_handle(), vec![], false);
+        let func = FuncOp::new(&mut ctx, "attributes".try_into().unwrap(), func_ty);
+        let entry = func.get_or_create_entry_block(&mut ctx);
+        let asm = InlineAsmOp::new(&mut ctx, void_ty.into(), vec![], "nop;", "", side_effects);
+        if let Some((name, value)) = attribute {
+            let mut attrs = LlvmAttributesAttr::new();
+            attrs.set(name, value);
+            asm.set_attr_llvm_inline_asm_attrs(&ctx, attrs);
+        }
+        // Upstream accepts arbitrary LLVM attributes; export must preserve
+        // their semantics or explain that the attribute is unsupported.
+        asm.verify(&ctx).unwrap();
+        asm.get_operation().insert_at_back(entry, &ctx);
+        ReturnOp::new(&mut ctx, None)
+            .get_operation()
+            .insert_at_back(entry, &ctx);
+        func.get_operation().insert_at_back(module_block, &ctx);
+        export_module_to_string(&ctx, &module)
+    };
+    for side_effects in [false, true] {
+        for convergent in [false, true] {
+            let ir = export(
+                side_effects,
+                convergent.then_some(("convergent", LlvmAttrValue::Unit)),
+            )
+            .unwrap();
+            let sideeffect = if side_effects { " sideeffect" } else { "" };
+            let attribute = if convergent { " #0" } else { "" };
+            assert!(
+                ir.contains(&format!(
+                    "call void asm{sideeffect} \"nop;\", \"\"(){attribute}\n"
+                )),
+                "{ir}"
+            );
+            if convergent {
+                assert!(ir.contains("attributes #0 = { convergent }"), "{ir}");
+            }
+        }
+        assert_eq!(
+            export(side_effects, Some(("noduplicate", LlvmAttrValue::Unit))).unwrap_err(),
+            "unsupported LLVM inline asm call-site attribute `noduplicate`; only unit `convergent` is supported"
+        );
+        for value in [LlvmAttrValue::Int(0), LlvmAttrValue::Str("false".into())] {
+            assert_eq!(
+                export(side_effects, Some(("convergent", value))).unwrap_err(),
+                "LLVM inline asm `convergent` requires a unit attribute"
+            );
+        }
+    }
+}
+
+#[test]
 fn export_inline_asm_escapes_llvm_string_literals() {
     let mut ctx = Context::new();
 
