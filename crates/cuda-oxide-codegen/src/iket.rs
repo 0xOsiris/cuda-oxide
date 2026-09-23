@@ -1049,6 +1049,7 @@ mod tests {
             module,
             true,
             mir_lower::IntrinsicBackend::LlvmNvptx,
+            None,
         )
         .unwrap();
         assert!(!has_iket_operations(&ctx, module));
