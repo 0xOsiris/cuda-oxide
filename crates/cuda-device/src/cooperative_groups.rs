@@ -169,6 +169,8 @@ pub trait WarpCollective: ThreadGroup {
     ///
     /// PTX `match.any.sync.b32` (sm_70+). Raw hardware lane bits are
     /// translated into this group's rank space before being returned.
+    /// Use [`ThreadGroup::thread_rank`] to interpret these bits. For physical
+    /// warp-lane masks, call [`crate::warp::match_any_sync`] directly.
     fn match_any(&self, value: u32) -> u32;
 
     /// 64-bit value variant of [`match_any`](Self::match_any).
