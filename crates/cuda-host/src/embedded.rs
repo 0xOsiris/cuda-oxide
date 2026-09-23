@@ -12,16 +12,19 @@ pub use cuda_core::embedded::{
     embedded_modules_from_current_exe,
 };
 use cuda_core::{CudaContext, CudaModule, DriverError};
-use std::ffi::{CStr, OsStr, c_char, c_int, c_void};
-use std::mem::MaybeUninit;
-use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod mapped_image;
 
 /// Errors while discovering, building, or loading an embedded CUDA module.
 #[derive(Debug, Error)]
 pub enum EmbeddedModuleError {
+    /// The artifact anchor could not be associated with its original mapped file.
+    #[error("cannot read the binary containing the CUDA artifact anchor: {0}")]
+    MappedImage(#[source] std::io::Error),
+
     /// Reading the embedded artifact section failed.
     #[error(transparent)]
     Core(#[from] cuda_core::EmbeddedModuleError),
@@ -70,27 +73,24 @@ pub fn load_embedded_module(
     load_bundle(ctx, &bundle)
 }
 
-/// Load a named embedded artifact bundle from the binary that contains `addr`.
+/// Load a named artifact bundle from the binary containing `anchor`.
 ///
-/// [`load_embedded_module`] reads the bundle from the current executable,
-/// which is right only while the `#[cuda_module]` was compiled into that
-/// executable. A module compiled into a shared object (a `cdylib` plugin, a
-/// Python extension module, an evcxr cell) carries its bundle in that object,
-/// and the process that later `dlopen`s it does not. This function asks the
-/// dynamic loader which binary maps `addr` and reads the bundle from there.
-/// The generated `load()` passes the address of its artifact anchor, which
-/// the linker places in the same binary as the bundle.
+/// Generated non-generic module loaders borrow their artifact anchor, which
+/// the linker places in the same image as the bundle. This works for both an
+/// executable and a shared library, including a library opened by a relative
+/// path before the working directory changes.
 ///
-/// When the loader has no absolute path for that binary (glibc names the
-/// main program by its `argv[0]`, which may be relative or a bare name), the
-/// current executable is read instead, exactly as [`load_embedded_module`]
-/// would. Payload handling is the same as well.
-pub fn load_embedded_module_from_address(
+/// On Linux and Android, this requires readable `/proc/self/maps` and
+/// `/proc/self/map_files`. The original mapped file must still be accessible.
+/// A missing, replaced, deleted or unreadable image is an error; it never
+/// causes a search in another binary. Other operating systems are unsupported.
+/// Payload selection and compilation are identical to [`load_embedded_module`].
+pub fn load_embedded_module_from_anchor(
     ctx: &Arc<CudaContext>,
     name: &str,
-    addr: *const u8,
+    anchor: &u8,
 ) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
-    let bundle = artifact_bundles_containing(addr)?
+    let bundle = artifact_bundles_containing(anchor)?
         .into_iter()
         .find(|bundle| bundle.name == name)
         .ok_or_else(|| EmbeddedModuleError::ModuleNotFound {
@@ -99,60 +99,24 @@ pub fn load_embedded_module_from_address(
     load_bundle(ctx, &bundle)
 }
 
-/// Artifact bundles of the binary that maps `addr`, falling back to the
-/// current executable when the loader does not name that binary by an
-/// absolute path.
 fn artifact_bundles_containing(
-    addr: *const u8,
+    anchor: &u8,
 ) -> Result<Vec<OwnedArtifactBundle>, EmbeddedModuleError> {
-    match binary_path_containing(addr) {
-        Some(path) if path.is_absolute() => Ok(artifact_bundles_from_binary_path(path)?),
-        _ => Ok(artifact_bundles_from_current_exe()?),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let bytes = mapped_image::read(anchor).map_err(EmbeddedModuleError::MappedImage)?;
+        oxide_artifacts::read_artifact_bundles_from_object_bytes(&bytes)
+            .map_err(cuda_core::EmbeddedModuleError::Artifacts)
+            .map_err(Into::into)
     }
-}
-
-/// Path of the executable or shared object that maps `addr`, as the dynamic
-/// loader recorded it: the `dlopen` argument for a shared object, `argv[0]`
-/// for the main program under glibc. `None` when no loaded object maps `addr`.
-fn binary_path_containing(addr: *const u8) -> Option<PathBuf> {
-    let mut info = MaybeUninit::<DlInfo>::zeroed();
-    // SAFETY: `dladdr` reads nothing through `addr` and writes every field of
-    // `info` when it returns non-zero; the all-zero start is itself a valid
-    // `Dl_info` (null pointers, null base).
-    let found = unsafe { dladdr(addr.cast(), info.as_mut_ptr()) };
-    if found == 0 {
-        return None;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = anchor;
+        Err(EmbeddedModuleError::MappedImage(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "artifact anchor discovery requires Linux or Android procfs",
+        )))
     }
-    // SAFETY: zero-initialised above and fully written by `dladdr`.
-    let info = unsafe { info.assume_init() };
-    if info.dli_fname.is_null() {
-        return None;
-    }
-    // SAFETY: `dli_fname` points at a NUL-terminated string owned by the
-    // loader, which keeps it alive while the object stays mapped; it is
-    // copied before this function returns.
-    let name = unsafe { CStr::from_ptr(info.dli_fname) };
-    Some(PathBuf::from(OsStr::from_bytes(name.to_bytes())))
-}
-
-/// `Dl_info` from `<dlfcn.h>`: the object and symbol that map an address.
-///
-/// Declared here, like `dladdr` below, instead of through the `libc` crate:
-/// a new dependency of cuda-host would invalidate the lockfile of every
-/// example workspace, and this is the one call cuda-host makes.
-#[repr(C)]
-#[allow(dead_code)] // layout only; `dli_fname` is the one field read
-struct DlInfo {
-    dli_fname: *const c_char,
-    dli_fbase: *mut c_void,
-    dli_sname: *const c_char,
-    dli_saddr: *mut c_void,
-}
-
-#[cfg_attr(not(target_feature = "crt-static"), link(name = "dl"))]
-unsafe extern "C" {
-    /// Fills `info` for the loaded object that maps `addr`; zero when none does.
-    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
 }
 
 /// Merge all PTX bundles from the current executable into a single CUDA module.
@@ -413,56 +377,12 @@ mod tests {
         assert!(concrete_bundle_target("sm_90x").is_err());
     }
 
-    fn canonical(path: &std::path::Path) -> PathBuf {
-        std::fs::canonicalize(path).expect("path exists")
-    }
-
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn address_in_the_executable_resolves_to_the_current_exe() {
-        // Same shape as the artifact anchor: a static linked into the binary.
+    fn bundles_of_an_executable_anchor_match_the_current_exe() {
         static ANCHOR: u8 = 0;
-        let path = binary_path_containing(std::ptr::addr_of!(ANCHOR))
-            .expect("the test executable is a loaded object");
-        assert_eq!(
-            canonical(&path),
-            canonical(&std::env::current_exe().unwrap())
-        );
-    }
-
-    #[test]
-    fn address_in_a_shared_object_resolves_to_that_object() {
-        #[cfg_attr(not(target_feature = "crt-static"), link(name = "dl"))]
-        unsafe extern "C" {
-            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-        }
-        // `RTLD_DEFAULT` from `<dlfcn.h>`: search every loaded object.
-        let rtld_default: *mut c_void = std::ptr::null_mut();
-        // `getpid` lives in the C library, a shared object that is not the
-        // test executable; `dlsym` returns its address in there.
-        let symbol = c"getpid";
-        // SAFETY: `RTLD_DEFAULT` is a valid pseudo-handle and `symbol` is
-        // NUL-terminated.
-        let addr = unsafe { dlsym(rtld_default, symbol.as_ptr()) };
-        assert!(!addr.is_null());
-        let path =
-            binary_path_containing(addr as *const u8).expect("the C library is a loaded object");
-        assert!(path.is_absolute(), "{}", path.display());
-        assert!(path.exists(), "{}", path.display());
-        assert_ne!(
-            canonical(&path),
-            canonical(&std::env::current_exe().unwrap())
-        );
-    }
-
-    #[test]
-    fn bundles_of_an_executable_address_match_the_current_exe() {
-        static ANCHOR: u8 = 0;
-        let by_address = artifact_bundles_containing(std::ptr::addr_of!(ANCHOR))
-            .map(|bundles| bundles.len())
-            .map_err(|error| error.to_string());
-        let by_current_exe = artifact_bundles_from_current_exe()
-            .map(|bundles| bundles.len())
-            .map_err(|error| error.to_string());
-        assert_eq!(by_address, by_current_exe);
+        let by_anchor = artifact_bundles_containing(&ANCHOR).unwrap();
+        let by_current_exe = artifact_bundles_from_current_exe().unwrap();
+        assert_eq!(by_anchor, by_current_exe);
     }
 }

@@ -168,7 +168,15 @@ pub(crate) fn expand_cuda_module_inner(
     let embedded_module_loader = quote! {
         match __cuda_oxide_artifact_anchor {
             ::core::option::Option::Some(anchor) => {
-                ::cuda_host::load_embedded_module_from_address(ctx, name, anchor)?
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                {
+                    ::cuda_host::load_embedded_module_from_anchor(ctx, name, anchor)?
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                {
+                    let _ = anchor;
+                    ::cuda_host::load_embedded_module(ctx, name)?
+                }
             }
             ::core::option::Option::None => ::cuda_host::load_embedded_module(ctx, name)?,
         }
@@ -851,7 +859,7 @@ fn cuda_module_artifact_anchor_statements(
         // Keep-alive handshake with the codegen backend: see the macro
         // crate's `cuda_module_artifact_anchor_statements` for details.
         #[allow(unused_mut)]
-        let mut __cuda_oxide_artifact_anchor: ::core::option::Option<*const ::core::primitive::u8> =
+        let mut __cuda_oxide_artifact_anchor: ::core::option::Option<&::core::primitive::u8> =
             ::core::option::Option::None;
         #(#references)*
     })
@@ -913,7 +921,10 @@ fn cuda_module_artifact_anchor_references(
                     }
                     __cuda_oxide_artifact_anchor = ::core::option::Option::Some(
                         ::std::hint::black_box(unsafe {
-                            ::core::ptr::addr_of!(CUDA_OXIDE_BUNDLE_ANCHOR)
+                            // The backend defines this initialized byte in the
+                            // artifact object retained by this image. Borrow it
+                            // only for this loader call; no reference escapes.
+                            &CUDA_OXIDE_BUNDLE_ANCHOR
                         }),
                     );
                 };

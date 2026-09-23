@@ -18,11 +18,11 @@ cuda-core = { workspace = true }
 cuda-artifact-finalizer = { workspace = true }
 ptx-parse = { workspace = true }
 sha2 = { workspace = true }
+oxide-artifacts = { workspace = true, features = ["object-read"] }
 thiserror = { workspace = true }
 cuda-async = { workspace = true, optional = true }
 
-# Architecture-correct O_NOFOLLOW/O_NONBLOCK/ELOOP for the LTOIR cache's
-# no-symlink open; the raw values differ between x86-64 and aarch64.
+# Platform-correct flags and device identity for cache and mapped-image reads.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
 
@@ -31,4 +31,5 @@ default = []
 async = ["dep:cuda-async", "cuda-macros/async"]
 
 [dev-dependencies]
+libloading = { workspace = true }
 cuda-device = { workspace = true }
