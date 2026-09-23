@@ -26,7 +26,7 @@ mod options_storage {
 pub(crate) fn set_lowering_options(ctx: &mut Context, options: LoweringOptions) {
     if let Some(index) = ctx
         .aux_data_map
-        .get(&*options_storage::LOWERING_OPTIONS_KEY)
+        .get(&options_storage::LOWERING_OPTIONS_KEY)
         .copied()
     {
         ctx.aux_data[index] = Box::new(options);
@@ -43,7 +43,7 @@ pub(crate) fn set_lowering_options(ctx: &mut Context, options: LoweringOptions) 
 /// original `lower_mir_to_llvm` entry point.
 pub(crate) fn lowering_options(ctx: &Context) -> LoweringOptions {
     ctx.aux_data_map
-        .get(&*options_storage::LOWERING_OPTIONS_KEY)
+        .get(&options_storage::LOWERING_OPTIONS_KEY)
         .and_then(|index| ctx.aux_data[*index].downcast_ref::<LoweringOptions>())
         .copied()
         .unwrap_or_default()
