@@ -73,7 +73,7 @@
 //!
 //! ```rust,ignore
 //! let tile = block.tiled_partition::<16>();
-//! let m_h2 = tile.ballot(tag == h2);  // mask is 0xFFFF or 0xFFFF0000
+//! let m_h2 = tile.ballot(tag == h2);  // mask bits are tile-relative: 0..15
 //! ```
 
 use crate::{cluster, grid, shared::SharedArray, thread, warp};
@@ -165,12 +165,12 @@ pub trait WarpCollective: ThreadGroup {
     /// `f32` variant of [`shfl_up`](Self::shfl_up).
     fn shfl_up_f32(&self, var: f32, delta: u32) -> f32;
 
-    /// Bitmask of lanes in this group whose `value` equals mine.
+    /// Group-relative bitmask of lanes whose `value` equals mine.
     ///
-    /// PTX `match.any.sync.b32` (sm_70+). Bits are absolute warp-lane
-    /// positions; the implementation already AND-s the raw hardware
-    /// result with the group's participation mask, so the returned
-    /// bits are guaranteed to be a subset of `mask()`.
+    /// PTX `match.any.sync.b32` (sm_70+). Raw hardware lane bits are
+    /// translated into this group's rank space before being returned.
+    /// Use [`ThreadGroup::thread_rank`] to interpret these bits. For physical
+    /// warp-lane masks, call [`crate::warp::match_any_sync`] directly.
     fn match_any(&self, value: u32) -> u32;
 
     /// 64-bit value variant of [`match_any`](Self::match_any).
@@ -178,8 +178,8 @@ pub trait WarpCollective: ThreadGroup {
     /// PTX `match.any.sync.b64` (sm_70+).
     fn match_any_i64(&self, value: u64) -> u32;
 
-    /// Group's participation mask if every lane in the group has the same
-    /// `value`, else 0.
+    /// Group-relative mask of all members if every lane in the group has
+    /// the same `value`, else 0.
     ///
     /// PTX `match.all.sync.b32` (sm_70+). Recover the all-match predicate
     /// as `result != 0`.
@@ -550,22 +550,42 @@ impl<const N: u32> WarpCollective for WarpTile<N> {
 
     #[inline(always)]
     fn match_any(&self, value: u32) -> u32 {
-        warp::match_any_sync(self.mask(), value) & self.mask()
+        let raw = warp::match_any_sync(self.mask(), value);
+        if N == 32 {
+            raw
+        } else {
+            raw >> self.tile_base_lane()
+        }
     }
 
     #[inline(always)]
     fn match_any_i64(&self, value: u64) -> u32 {
-        warp::match_any_i64_sync(self.mask(), value) & self.mask()
+        let raw = warp::match_any_i64_sync(self.mask(), value);
+        if N == 32 {
+            raw
+        } else {
+            raw >> self.tile_base_lane()
+        }
     }
 
     #[inline(always)]
     fn match_all(&self, value: u32) -> u32 {
-        warp::match_all_sync(self.mask(), value)
+        let raw = warp::match_all_sync(self.mask(), value);
+        if N == 32 {
+            raw
+        } else {
+            raw >> self.tile_base_lane()
+        }
     }
 
     #[inline(always)]
     fn match_all_i64(&self, value: u64) -> u32 {
-        warp::match_all_i64_sync(self.mask(), value)
+        let raw = warp::match_all_i64_sync(self.mask(), value);
+        if N == 32 {
+            raw
+        } else {
+            raw >> self.tile_base_lane()
+        }
     }
 }
 
@@ -680,8 +700,7 @@ impl ThreadGroup for CoalescedThreads {
 impl WarpCollective for CoalescedThreads {
     #[inline(always)]
     fn ballot(&self, predicate: bool) -> u32 {
-        let raw = warp::ballot_sync(self.mask, predicate);
-        self.pack_lanes(raw)
+        self.pack_lanes(warp::ballot_sync(self.mask, predicate))
     }
 
     #[inline(always)]
@@ -769,22 +788,22 @@ impl WarpCollective for CoalescedThreads {
 
     #[inline(always)]
     fn match_any(&self, value: u32) -> u32 {
-        warp::match_any_sync(self.mask, value) & self.mask
+        self.pack_lanes(warp::match_any_sync(self.mask, value))
     }
 
     #[inline(always)]
     fn match_any_i64(&self, value: u64) -> u32 {
-        warp::match_any_i64_sync(self.mask, value) & self.mask
+        self.pack_lanes(warp::match_any_i64_sync(self.mask, value))
     }
 
     #[inline(always)]
     fn match_all(&self, value: u32) -> u32 {
-        warp::match_all_sync(self.mask, value)
+        self.pack_lanes(warp::match_all_sync(self.mask, value))
     }
 
     #[inline(always)]
     fn match_all_i64(&self, value: u64) -> u32 {
-        warp::match_all_i64_sync(self.mask, value)
+        self.pack_lanes(warp::match_all_i64_sync(self.mask, value))
     }
 }
 
