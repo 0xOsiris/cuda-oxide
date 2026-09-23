@@ -15,14 +15,21 @@ use cuda_core::{CudaContext, CudaModule, DriverError};
 use std::sync::Arc;
 use thiserror::Error;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod mapped_image;
+
 /// Errors while discovering, building, or loading an embedded CUDA module.
 #[derive(Debug, Error)]
 pub enum EmbeddedModuleError {
+    /// The artifact anchor could not be associated with its original mapped file.
+    #[error("cannot read the binary containing the CUDA artifact anchor: {0}")]
+    MappedImage(#[source] std::io::Error),
+
     /// Reading the embedded artifact section failed.
     #[error(transparent)]
     Core(#[from] cuda_core::EmbeddedModuleError),
 
-    /// The named bundle was not present in the current executable.
+    /// The named bundle was not present in the binary that was read.
     #[error("embedded CUDA module '{name}' was not found")]
     ModuleNotFound { name: String },
 
@@ -64,6 +71,52 @@ pub fn load_embedded_module(
             name: name.to_string(),
         })?;
     load_bundle(ctx, &bundle)
+}
+
+/// Load a named artifact bundle from the binary containing `anchor`.
+///
+/// Generated non-generic module loaders borrow their artifact anchor, which
+/// the linker places in the same image as the bundle. This works for both an
+/// executable and a shared library, including a library opened by a relative
+/// path before the working directory changes.
+///
+/// On Linux and Android, this requires readable `/proc/self/maps` and
+/// `/proc/self/map_files`. The original mapped file must still be accessible.
+/// A missing, replaced, deleted or unreadable image is an error; it never
+/// causes a search in another binary. Other operating systems are unsupported.
+/// Payload selection and compilation are identical to [`load_embedded_module`].
+pub fn load_embedded_module_from_anchor(
+    ctx: &Arc<CudaContext>,
+    name: &str,
+    anchor: &u8,
+) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
+    let bundle = artifact_bundles_containing(anchor)?
+        .into_iter()
+        .find(|bundle| bundle.name == name)
+        .ok_or_else(|| EmbeddedModuleError::ModuleNotFound {
+            name: name.to_string(),
+        })?;
+    load_bundle(ctx, &bundle)
+}
+
+fn artifact_bundles_containing(
+    anchor: &u8,
+) -> Result<Vec<OwnedArtifactBundle>, EmbeddedModuleError> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let bytes = mapped_image::read(anchor).map_err(EmbeddedModuleError::MappedImage)?;
+        oxide_artifacts::read_artifact_bundles_from_object_bytes(&bytes)
+            .map_err(cuda_core::EmbeddedModuleError::Artifacts)
+            .map_err(Into::into)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = anchor;
+        Err(EmbeddedModuleError::MappedImage(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "artifact anchor discovery requires Linux or Android procfs",
+        )))
+    }
 }
 
 /// Merge all PTX bundles from the current executable into a single CUDA module.
@@ -322,5 +375,14 @@ mod tests {
     #[test]
     fn target_arch_rejects_malformed_bundle_target() {
         assert!(concrete_bundle_target("sm_90x").is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn bundles_of_an_executable_anchor_match_the_current_exe() {
+        static ANCHOR: u8 = 0;
+        let by_anchor = artifact_bundles_containing(&ANCHOR).unwrap();
+        let by_current_exe = artifact_bundles_from_current_exe().unwrap();
+        assert_eq!(by_anchor, by_current_exe);
     }
 }
