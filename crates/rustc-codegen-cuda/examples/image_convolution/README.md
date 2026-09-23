@@ -23,7 +23,7 @@ Running the example without arguments performs a deterministic correctness test:
 cargo oxide run image_convolution
 ```
 
-The test uses a 37x23 image so the dimensions are deliberately not divisible by the 16x16 block size. This exercises partial blocks on both axes as well as the bottom-right corner.
+The test covers 1x1, 1x17, 17x1, 2x3, 16x16, 17x17, and 37x23 images. These include tiny images with no interior pixels, exact tiles, and partial blocks on both axes. Shared-memory staging uses raw element pointers, with a block barrier before neighboring threads read the tile.
 
 Both GPU implementations are compared against a CPU reference implementation.
 

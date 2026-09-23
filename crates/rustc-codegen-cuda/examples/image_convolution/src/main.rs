@@ -17,8 +17,6 @@ use cuda_device::{
     launch_contract, thread,
 };
 
-const WIDTH: usize = 37;
-const HEIGHT: usize = 23;
 const BLOCK: u32 = 16;
 const IMAGE_DEMO_PASSES: usize = 128;
 
@@ -126,6 +124,10 @@ mod kernels {
 
         static mut TILE: SharedArray<f32, SHARED_ELEMENTS> = SharedArray::UNINIT;
 
+        // Derive raw element pointers so cooperative writers do not borrow
+        // the complete shared allocation mutably in every thread.
+        let tile = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TILE) };
+
         let tx = thread::threadIdx_x() as usize;
         let ty = thread::threadIdx_y() as usize;
         let local_tid = ty * OUTPUT_TILE + tx;
@@ -151,7 +153,7 @@ mod kernels {
             };
 
             unsafe {
-                TILE[shared_idx] = value;
+                tile.add(shared_idx).write(value);
             }
 
             shared_idx += THREADS_PER_BLOCK;
@@ -174,17 +176,17 @@ mod kernels {
             let mut sum = 0.0f32;
 
             unsafe {
-                sum += TILE[(sy - 1) * SHARED_TILE + (sx - 1)];
-                sum += 2.0 * TILE[(sy - 1) * SHARED_TILE + sx];
-                sum += TILE[(sy - 1) * SHARED_TILE + (sx + 1)];
+                sum += tile.add((sy - 1) * SHARED_TILE + (sx - 1)).read();
+                sum += 2.0 * tile.add((sy - 1) * SHARED_TILE + sx).read();
+                sum += tile.add((sy - 1) * SHARED_TILE + (sx + 1)).read();
 
-                sum += 2.0 * TILE[sy * SHARED_TILE + (sx - 1)];
-                sum += 4.0 * TILE[sy * SHARED_TILE + sx];
-                sum += 2.0 * TILE[sy * SHARED_TILE + (sx + 1)];
+                sum += 2.0 * tile.add(sy * SHARED_TILE + (sx - 1)).read();
+                sum += 4.0 * tile.add(sy * SHARED_TILE + sx).read();
+                sum += 2.0 * tile.add(sy * SHARED_TILE + (sx + 1)).read();
 
-                sum += TILE[(sy + 1) * SHARED_TILE + (sx - 1)];
-                sum += 2.0 * TILE[(sy + 1) * SHARED_TILE + sx];
-                sum += TILE[(sy + 1) * SHARED_TILE + (sx + 1)];
+                sum += tile.add((sy + 1) * SHARED_TILE + (sx - 1)).read();
+                sum += 2.0 * tile.add((sy + 1) * SHARED_TILE + sx).read();
+                sum += tile.add((sy + 1) * SHARED_TILE + (sx + 1)).read();
             }
 
             if let Some(mut cell) = output.tile_2d32_rt(coord) {
@@ -231,9 +233,9 @@ fn convolution_cpu(input: &[f32], width: usize, height: usize) -> Vec<f32> {
     output
 }
 
-fn run_synthetic_validation() -> Result<(), Box<dyn std::error::Error>> {
+fn validate_shape(width: usize, height: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Image Convolution Example ===");
-    println!("Image: {WIDTH}x{HEIGHT}");
+    println!("Image: {width}x{height}");
     println!("Kernel: 3x3 Gaussian, zero-padded edges");
     println!("Block: {BLOCK}x{BLOCK}");
 
@@ -242,26 +244,28 @@ fn run_synthetic_validation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Non-trivial deterministic input makes incorrect indexing easier to
     // detect than a constant or simple linear image.
-    let input_host: Vec<f32> = (0..HEIGHT)
+    let input_host: Vec<f32> = (0..height)
         .flat_map(|y| {
-            (0..WIDTH).map(move |x| {
-                let value = (x * 17 + y * 13 + (x * y) % 29) % 251;
+            (0..width).map(move |x| {
+                let value = 1 + (x * 17 + y * 13 + (x * y) % 29) % 250;
                 value as f32 / 251.0
             })
         })
         .collect();
 
-    let expected = convolution_cpu(&input_host, WIDTH, HEIGHT);
+    let expected = convolution_cpu(&input_host, width, height);
 
     let input_dev = DeviceBuffer::from_host(&stream, &input_host)?;
-    let mut naive_output_dev = DeviceBuffer::<f32>::zeroed(&stream, WIDTH * HEIGHT)?;
-    let mut tiled_output_dev = DeviceBuffer::<f32>::zeroed(&stream, WIDTH * HEIGHT)?;
+    // A missing output write must fail even when the CPU result is zero.
+    let sentinel = vec![f32::NAN; width * height];
+    let mut naive_output_dev = DeviceBuffer::from_host(&stream, &sentinel)?;
+    let mut tiled_output_dev = DeviceBuffer::from_host(&stream, &sentinel)?;
 
     let module = unsafe { kernels::load(&ctx)? };
 
     let grid = (
-        (WIDTH as u32).div_ceil(BLOCK),
-        (HEIGHT as u32).div_ceil(BLOCK),
+        (width as u32).div_ceil(BLOCK),
+        (height as u32).div_ceil(BLOCK),
     );
     let config = LaunchConfig2D::new(grid, (BLOCK, BLOCK), 0);
 
@@ -271,19 +275,19 @@ fn run_synthetic_validation() -> Result<(), Box<dyn std::error::Error>> {
     module.convolution_naive(
         &stream,
         &naive_launch,
-        WIDTH as u32,
-        HEIGHT as u32,
+        width as u32,
+        height as u32,
         &input_dev,
-        cuda_host::RowWidth::new(&mut naive_output_dev, WIDTH as u32),
+        cuda_host::RowWidth::new(&mut naive_output_dev, width as u32),
     )?;
 
     module.convolution_tiled(
         &stream,
         &tiled_launch,
-        WIDTH as u32,
-        HEIGHT as u32,
+        width as u32,
+        height as u32,
         &input_dev,
-        cuda_host::RowWidth::new(&mut tiled_output_dev, WIDTH as u32),
+        cuda_host::RowWidth::new(&mut tiled_output_dev, width as u32),
     )?;
 
     let naive_actual = naive_output_dev.to_host_vec(&stream)?;
@@ -295,8 +299,8 @@ fn run_synthetic_validation() -> Result<(), Box<dyn std::error::Error>> {
             naive_error <= 1e-6,
             "naive mismatch at pixel {} ({}, {}): expected {}, got {}, error {}",
             i,
-            i % WIDTH,
-            i / WIDTH,
+            i % width,
+            i / width,
             expected[i],
             naive_actual[i],
             naive_error
@@ -307,8 +311,8 @@ fn run_synthetic_validation() -> Result<(), Box<dyn std::error::Error>> {
             tiled_error <= 1e-6,
             "tiled mismatch at pixel {} ({}, {}): expected {}, got {}, error {}",
             i,
-            i % WIDTH,
-            i / WIDTH,
+            i % width,
+            i / width,
             expected[i],
             tiled_actual[i],
             tiled_error
@@ -317,8 +321,25 @@ fn run_synthetic_validation() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("✓ naive convolution matches CPU reference");
     println!("✓ tiled convolution matches CPU reference");
-    println!("SUCCESS: image convolution verified.");
 
+    Ok(())
+}
+
+fn run_synthetic_validation() -> Result<(), Box<dyn std::error::Error>> {
+    // Tiny images stress halos without any interior pixels; 16/17 cover exact
+    // tiles and a one-pixel tail. The rectangular case leaves tails on both axes.
+    for (width, height) in [
+        (1, 1),
+        (1, 17),
+        (17, 1),
+        (2, 3),
+        (16, 16),
+        (17, 17),
+        (37, 23),
+    ] {
+        validate_shape(width, height)?;
+    }
+    println!("SUCCESS: image convolution verified.");
     Ok(())
 }
 
