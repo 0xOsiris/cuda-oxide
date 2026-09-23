@@ -54,8 +54,10 @@ pub mod kernels {
     #[kernel]
     pub fn bin_shared_roundtrip(mut out: DisjointSlice<f64>) {
         static mut S: SharedArray<f64, 1> = SharedArray::UNINIT;
-        // SAFETY: slot 0 is written before the barrier and read after it.
-        unsafe { S[0] = 2.5 };
+        if thread::threadIdx_x() == 0 {
+            // SAFETY: only thread 0 accesses slot 0, before the block barrier.
+            unsafe { S[0] = 2.5 };
+        }
         thread::sync_threads();
         if thread::threadIdx_x() == 0 && !out.is_empty() {
             // SAFETY: thread 0 only, length checked.
