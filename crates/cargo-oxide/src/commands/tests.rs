@@ -3316,25 +3316,25 @@ fn parse_gpu_name_cap_and_driver_splits_on_last_two_commas() {
 
 #[test]
 fn cuda_toolkit_resolution_prefers_toolkit_path_then_home() {
-    let accept_all = |_: &str| Ok(13_030);
+    let accept_all = |_: &Path| Ok(13_030);
 
     let both = resolve_cuda_toolkit(
         |var| match var {
-            "CUDA_TOOLKIT_PATH" => Some("/cuda/toolkit".to_string()),
-            "CUDA_HOME" => Some("/cuda/home".to_string()),
+            "CUDA_TOOLKIT_PATH" => Some("/cuda/toolkit".into()),
+            "CUDA_HOME" => Some("/cuda/home".into()),
             _ => None,
         },
         accept_all,
     );
-    assert_eq!(both.root, "/cuda/toolkit");
+    assert_eq!(both.root, Path::new("/cuda/toolkit"));
     assert_eq!(both.source, ToolkitSource::Explicit("CUDA_TOOLKIT_PATH"));
     assert!(both.rejected.is_empty());
 
     let home_only = resolve_cuda_toolkit(
-        |var| (var == "CUDA_HOME").then(|| "/cuda/home".to_string()),
+        |var| (var == "CUDA_HOME").then(|| "/cuda/home".into()),
         accept_all,
     );
-    assert_eq!(home_only.root, "/cuda/home");
+    assert_eq!(home_only.root, Path::new("/cuda/home"));
     assert_eq!(home_only.source, ToolkitSource::Explicit("CUDA_HOME"));
 }
 
@@ -3344,11 +3344,11 @@ fn an_explicit_toolkit_that_does_not_validate_is_answered_not_stepped_over() {
     // rather than falling through to discovery. A typo in CUDA_HOME must not
     // read here as a healthy default install (#1265).
     let typo = resolve_cuda_toolkit(
-        |var| (var == "CUDA_HOME").then(|| "/cuda/typo".to_string()),
-        |root| Err(format!("{root} does not contain cuda.h")),
+        |var| (var == "CUDA_HOME").then(|| "/cuda/typo".into()),
+        |root| Err(format!("{} does not contain cuda.h", root.display())),
     );
     assert_eq!(typo.source, ToolkitSource::Unresolved);
-    assert_eq!(typo.root, "/cuda/typo");
+    assert_eq!(typo.root, Path::new("/cuda/typo"));
     assert_eq!(
         typo.rejected,
         vec!["CUDA_HOME=/cuda/typo is invalid: /cuda/typo does not contain cuda.h"]
@@ -3356,7 +3356,7 @@ fn an_explicit_toolkit_that_does_not_validate_is_answered_not_stepped_over() {
 
     // An empty value is its own error there, not an unset variable.
     let empty = resolve_cuda_toolkit(
-        |var| (var == "CUDA_TOOLKIT_PATH").then(String::new),
+        |var| (var == "CUDA_TOOLKIT_PATH").then(std::ffi::OsString::new),
         |_| Ok(13_030),
     );
     assert_eq!(empty.source, ToolkitSource::Unresolved);
@@ -3364,6 +3364,34 @@ fn an_explicit_toolkit_that_does_not_validate_is_answered_not_stepped_over() {
         empty.rejected,
         vec!["CUDA_TOOLKIT_PATH is set to an empty string"]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn toolkit_resolution_preserves_non_unicode_explicit_paths() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let parent = unique_temp_dir("cargo_oxide_toolkit_non_unicode");
+    let root = parent.join(std::ffi::OsString::from_vec(b"cuda-\xff".to_vec()));
+    fs::create_dir_all(root.join("include")).unwrap();
+    fs::write(root.join("include/cuda.h"), "#define CUDA_VERSION 13000\n").unwrap();
+
+    let resolve = || {
+        resolve_cuda_toolkit(
+            |key| (key == "CUDA_TOOLKIT_PATH").then(|| root.clone().into_os_string()),
+            |path| validate_cuda_toolkit(path, None),
+        )
+    };
+    let choice = resolve();
+    assert_eq!(choice.root, root);
+    assert_eq!(choice.source, ToolkitSource::Explicit("CUDA_TOOLKIT_PATH"));
+
+    fs::remove_file(root.join("include/cuda.h")).unwrap();
+    let rejected = resolve();
+    assert_eq!(rejected.root, root);
+    assert_eq!(rejected.source, ToolkitSource::Unresolved);
+    assert_eq!(rejected.rejected.len(), 1);
+    fs::remove_dir_all(parent).unwrap();
 }
 
 #[test]
@@ -3377,15 +3405,15 @@ fn discovery_takes_the_first_candidate_that_validates() {
     let choice = resolve_cuda_toolkit(
         |_| None,
         |root| {
-            if root == chosen {
+            if root == Path::new(chosen) {
                 Ok(13_020)
             } else {
-                Err(format!("{root} does not contain cuda.h"))
+                Err(format!("{} does not contain cuda.h", root.display()))
             }
         },
     );
     assert_eq!(choice.source, ToolkitSource::Discovered);
-    assert_eq!(choice.root, chosen);
+    assert_eq!(choice.root, Path::new(chosen));
     assert_eq!(
         choice.rejected,
         vec![format!("{skipped}: {skipped} does not contain cuda.h")]
@@ -3393,9 +3421,15 @@ fn discovery_takes_the_first_candidate_that_validates() {
 
     // Nothing validates: every candidate is reported, and the root is only
     // somewhere to point the message.
-    let nothing = resolve_cuda_toolkit(|_| None, |root| Err(format!("{root} is not a directory")));
+    let nothing = resolve_cuda_toolkit(
+        |_| None,
+        |root| Err(format!("{} is not a directory", root.display())),
+    );
     assert_eq!(nothing.source, ToolkitSource::Unresolved);
-    assert_eq!(nothing.root, *DEFAULT_TOOLKIT_CANDIDATES.last().unwrap());
+    assert_eq!(
+        nothing.root,
+        Path::new(DEFAULT_TOOLKIT_CANDIDATES.last().unwrap())
+    );
     assert_eq!(nothing.rejected.len(), DEFAULT_TOOLKIT_CANDIDATES.len());
 }
 
@@ -3408,6 +3442,18 @@ fn validate_cuda_toolkit_applies_the_build_scripts_acceptance() {
 
     fs::write(&cuda_h, "#define CUDA_VERSION 13030\n").unwrap();
     assert_eq!(validate_cuda_toolkit(&root_str, None), Ok(13_030));
+
+    // A host include directory must never shadow an explicit target tree.
+    assert!(validate_cuda_toolkit(&root_str, Some("missing-target")).is_err());
+    let target = root.join("targets/test-target/include");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("cuda.h"), "#define CUDA_VERSION 13000\n").unwrap();
+    assert_eq!(
+        validate_cuda_toolkit(&root_str, Some("test-target")),
+        Ok(13_000)
+    );
+    fs::write(target.join("cuda.h"), "#define CUDA_VERSION 12080\n").unwrap();
+    assert!(validate_cuda_toolkit(&root_str, Some("test-target")).is_err());
 
     // The floor is the build script's 13.0, not a guess: a toolkit below it
     // is rejected even though cuda.h is right there.
@@ -3423,7 +3469,7 @@ fn validate_cuda_toolkit_applies_the_build_scripts_acceptance() {
         "{headerless}"
     );
 
-    let absent = validate_cuda_toolkit(&format!("{root_str}/nope"), None).unwrap_err();
+    let absent = validate_cuda_toolkit(format!("{root_str}/nope"), None).unwrap_err();
     assert!(absent.contains("is not a directory"), "{absent}");
 
     fs::remove_dir_all(&root).ok();
@@ -3484,10 +3530,9 @@ fn cuda_header_candidates_cover_standard_and_redistributable_layouts() {
     // a blank value means "unset".
     assert_eq!(
         cuda_header_candidates("/opt/ctk", Some("aarch64-linux"), "aarch64", "linux"),
-        vec![
-            PathBuf::from("/opt/ctk/include/cuda.h"),
-            PathBuf::from("/opt/ctk/targets/aarch64-linux/include/cuda.h"),
-        ]
+        vec![PathBuf::from(
+            "/opt/ctk/targets/aarch64-linux/include/cuda.h"
+        )]
     );
     assert_eq!(
         cuda_header_candidates("/opt/ctk", Some("  "), "x86_64", "linux"),

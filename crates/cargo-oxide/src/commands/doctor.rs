@@ -434,7 +434,7 @@ pub fn doctor(ctx: &Context) {
     print!("CUDA headers (cuda.h)... ");
     let target_dir_override = std::env::var("CUDA_TOOLKIT_TARGET_DIR").ok();
     let toolkit_choice = resolve_cuda_toolkit(
-        |var| std::env::var(var).ok(),
+        |key| std::env::var_os(key),
         |root| validate_cuda_toolkit(root, target_dir_override.as_deref()),
     );
     let header_candidates = cuda_header_candidates(
@@ -459,7 +459,7 @@ pub fn doctor(ctx: &Context) {
         _ => {
             println!(
                 "✗ no usable CUDA toolkit; nearest root probed was `{}`",
-                toolkit_choice.root
+                toolkit_choice.root.display()
             );
             eprintln!("  Probed for cuda.h:");
             for candidate in &header_candidates {
@@ -510,7 +510,10 @@ pub fn doctor(ctx: &Context) {
                     .or_else(|| project_config_env(ctx, key).map(str::to_owned))
             });
             println!("✗ nvcc not found");
-            eprintln!("  Probed PATH, {toolkit}/bin/nvcc, and the standard install roots.");
+            eprintln!(
+                "  Probed PATH, {}/bin/nvcc, and the standard install roots.",
+                toolkit.display()
+            );
             eprintln!("  Set CUDA_TOOLKIT_PATH or CUDA_HOME to a CUDA 13.0+ toolkit install");
             eprintln!("  root; when neither is set, these roots are tried in order:");
             for candidate in DEFAULT_TOOLKIT_CANDIDATES {
@@ -831,7 +834,7 @@ pub(super) enum ToolkitSource {
 /// the way, which is the part a user needs when two toolkits are installed.
 #[derive(Debug)]
 pub(super) struct ToolkitChoice {
-    pub(super) root: String,
+    pub(super) root: PathBuf,
     pub(super) source: ToolkitSource,
     /// `<root or variable>: <reason>`, in probe order.
     pub(super) rejected: Vec<String>,
@@ -861,8 +864,8 @@ pub(super) struct ToolkitChoice {
 /// `CUDA_VERSION` or why not; it is injected so the ordering can be tested
 /// without a filesystem.
 pub(super) fn resolve_cuda_toolkit(
-    mut get_env: impl FnMut(&str) -> Option<String>,
-    mut validate: impl FnMut(&str) -> Result<u32, String>,
+    mut get_env: impl FnMut(&str) -> Option<std::ffi::OsString>,
+    mut validate: impl FnMut(&Path) -> Result<u32, String>,
 ) -> ToolkitChoice {
     for var in TOOLKIT_ENV_VARS {
         let Some(value) = get_env(var) else {
@@ -878,6 +881,7 @@ pub(super) fn resolve_cuda_toolkit(
                 rejected: vec![format!("{var} is set to an empty string")],
             };
         }
+        let value = PathBuf::from(value);
         return match validate(&value) {
             Ok(_) => ToolkitChoice {
                 root: value,
@@ -885,7 +889,7 @@ pub(super) fn resolve_cuda_toolkit(
                 rejected: Vec::new(),
             },
             Err(reason) => ToolkitChoice {
-                rejected: vec![format!("{var}={value} is invalid: {reason}")],
+                rejected: vec![format!("{var}={} is invalid: {reason}", value.display())],
                 root: value,
                 source: ToolkitSource::Unresolved,
             },
@@ -894,10 +898,10 @@ pub(super) fn resolve_cuda_toolkit(
 
     let mut rejected = Vec::new();
     for candidate in DEFAULT_TOOLKIT_CANDIDATES {
-        match validate(candidate) {
+        match validate(Path::new(candidate)) {
             Ok(_) => {
                 return ToolkitChoice {
-                    root: candidate.to_string(),
+                    root: PathBuf::from(candidate),
                     source: ToolkitSource::Discovered,
                     rejected,
                 };
@@ -916,22 +920,25 @@ pub(super) fn resolve_cuda_toolkit(
 /// Where to point a message when nothing resolved. Not a discovery result:
 /// the build script errors in this situation, and the callers that only want
 /// a path to probe still need one.
-fn last_resort_toolkit_root() -> String {
+fn last_resort_toolkit_root() -> PathBuf {
     DEFAULT_TOOLKIT_CANDIDATES
         .last()
         .expect("candidate list is never empty")
-        .to_string()
+        .into()
 }
 
 /// `resolve_cuda_toolkit` against the real filesystem, for callers that want
 /// only the root.
-pub(super) fn cuda_toolkit_root(get_env: impl FnMut(&str) -> Option<String>) -> String {
-    resolve_cuda_toolkit(get_env, |root| {
-        validate_cuda_toolkit(
-            root,
-            std::env::var("CUDA_TOOLKIT_TARGET_DIR").ok().as_deref(),
-        )
-    })
+pub(super) fn cuda_toolkit_root(mut get_env: impl FnMut(&str) -> Option<String>) -> PathBuf {
+    resolve_cuda_toolkit(
+        |key| get_env(key).map(Into::into),
+        |root| {
+            validate_cuda_toolkit(
+                root,
+                std::env::var("CUDA_TOOLKIT_TARGET_DIR").ok().as_deref(),
+            )
+        },
+    )
     .root
 }
 
@@ -940,11 +947,12 @@ pub(super) fn cuda_toolkit_root(get_env: impl FnMut(&str) -> Option<String>) -> 
 /// [`cuda_header_candidates`] lists, and that header's `CUDA_VERSION` must
 /// clear [`MIN_CUDA_VERSION`].
 pub(super) fn validate_cuda_toolkit(
-    root: &str,
+    root: impl AsRef<Path>,
     target_dir_override: Option<&str>,
 ) -> Result<u32, String> {
-    if !Path::new(root).is_dir() {
-        return Err(format!("{root} is not a directory"));
+    let root = root.as_ref();
+    if !root.is_dir() {
+        return Err(format!("{} is not a directory", root.display()));
     }
     let candidates = cuda_header_candidates(
         root,
@@ -953,7 +961,7 @@ pub(super) fn validate_cuda_toolkit(
         std::env::consts::OS,
     );
     let Some(header) = candidates.iter().find(|path| path.is_file()) else {
-        return Err(format!("{root} does not contain cuda.h"));
+        return Err(format!("{} does not contain cuda.h", root.display()));
     };
     let contents = std::fs::read_to_string(header)
         .map_err(|error| format!("{} could not be read: {error}", header.display()))?;
@@ -992,11 +1000,11 @@ pub(super) fn format_cuda_version(version: u32) -> String {
 /// between servers (`sbsa-linux`) and Tegra (`aarch64-linux`), so both are
 /// probed in that order. A non-blank `target_dir_override` (the
 /// `CUDA_TOOLKIT_TARGET_DIR` variable, like nvcc's `-target-dir`) replaces
-/// the table with that single directory.
+/// all candidates with that single directory, including the standard layout.
 ///
 /// Mirrors BY HAND the selection table in the shared `cuda-bindings` build
 /// sources in NVlabs/cutile-rs (`cuda-bindings/toolkit_target.rs`,
-/// `resolve_toolkit_target_dirs`): doctor cannot import it because
+/// `resolve_toolkit_include_candidates`): doctor cannot import it because
 /// build-script sources are not a library. If the selection there changes,
 /// mirror it here.
 ///
@@ -1005,20 +1013,23 @@ pub(super) fn format_cuda_version(version: u32) -> String {
 /// runtime, so there are no cargo target cfgs to consult). Injected as
 /// parameters for unit tests.
 pub(super) fn cuda_header_candidates(
-    toolkit: &str,
+    toolkit: impl AsRef<Path>,
     target_dir_override: Option<&str>,
     arch: &str,
     os: &str,
 ) -> Vec<PathBuf> {
-    let base = Path::new(toolkit);
+    let base = toolkit.as_ref();
+    if let Some(dir) = target_dir_override.filter(|dir| !dir.trim().is_empty()) {
+        // Match cuda-bindings: a named target tree is exclusive. The top-level
+        // include directory usually aliases the host tree and must not hide a
+        // missing or incompatible explicitly selected tree.
+        return vec![base.join("targets").join(dir).join("include/cuda.h")];
+    }
     let mut candidates = vec![base.join("include/cuda.h")];
-    let target_dirs: Vec<&str> = match target_dir_override.filter(|dir| !dir.trim().is_empty()) {
-        Some(dir) => vec![dir],
-        None => match (arch, os) {
-            ("x86_64", "linux") => vec!["x86_64-linux"],
-            ("aarch64", "linux") => vec!["sbsa-linux", "aarch64-linux"],
-            _ => vec![],
-        },
+    let target_dirs: &[&str] = match (arch, os) {
+        ("x86_64", "linux") => &["x86_64-linux"],
+        ("aarch64", "linux") => &["sbsa-linux", "aarch64-linux"],
+        _ => &[],
     };
     for dir in target_dirs {
         candidates.push(base.join("targets").join(dir).join("include/cuda.h"));
